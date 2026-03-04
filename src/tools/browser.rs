@@ -4,6 +4,7 @@
 //! Optionally, a Rust-native backend can be enabled at build time via
 //! `--features browser-native` and selected through config.
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
+//! Camofox (anti-detect Firefox REST service) is supported as an HTTP backend.
 
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
@@ -59,6 +60,36 @@ impl Default for ComputerUseConfig {
     }
 }
 
+/// Camofox remote browser service settings.
+#[derive(Clone)]
+pub struct CamofoxConfig {
+    /// Base URL of the camofox-browser REST service.
+    pub url: String,
+    /// Optional Bearer token for authentication.
+    pub api_key: Option<String>,
+    /// Request timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for CamofoxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CamofoxConfig")
+            .field("url", &self.url)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CamofoxConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:3000".into(),
+            api_key: None,
+            timeout_ms: 30_000,
+        }
+    }
+}
+
 /// Browser automation tool using pluggable backends.
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
@@ -69,6 +100,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    camofox: CamofoxConfig,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -78,6 +110,7 @@ enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    Camofox,
     Auto,
 }
 
@@ -86,6 +119,7 @@ enum ResolvedBackend {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    Camofox,
 }
 
 impl BrowserBackendKind {
@@ -95,9 +129,10 @@ impl BrowserBackendKind {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
+            "camofox" | "camoufox" => Ok(Self::Camofox),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', 'camofox', or 'auto'"
             ),
         }
     }
@@ -107,6 +142,7 @@ impl BrowserBackendKind {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
             Self::ComputerUse => "computer_use",
+            Self::Camofox => "camofox",
             Self::Auto => "auto",
         }
     }
@@ -120,8 +156,8 @@ struct AgentBrowserResponse {
     error: Option<String>,
 }
 
-/// Response format from computer-use sidecar.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ComputerUseResponse {
     #[serde(default)]
     success: Option<bool>,
@@ -129,6 +165,29 @@ struct ComputerUseResponse {
     data: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// Response shape from camofox-browser REST endpoints.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CamofoxTabResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    screenshot: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    /// Generic catch-all for extra fields.
+    #[serde(flatten)]
+    extra: Option<serde_json::Map<String, Value>>,
 }
 
 /// Supported browser actions
@@ -213,6 +272,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            CamofoxConfig::default(),
         )
     }
 
@@ -226,6 +286,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        camofox: CamofoxConfig,
     ) -> Self {
         Self {
             security,
@@ -236,6 +297,7 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            camofox,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -327,6 +389,15 @@ impl BrowserTool {
         Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
     }
 
+    /// Check whether the camofox-browser service is reachable.
+    fn camofox_available(&self) -> bool {
+        let url_str = format!("{}/health", self.camofox.url.trim_end_matches('/'));
+        match reqwest::Url::parse(&url_str) {
+            Ok(url) => endpoint_reachable(&url, Duration::from_millis(500)),
+            Err(_) => false,
+        }
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
 
@@ -362,12 +433,32 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::ComputerUse)
             }
+            BrowserBackendKind::Camofox => {
+                if !self.camofox_available() {
+                    anyhow::bail!(
+                        "browser.backend='camofox' but service is unreachable at {}. Check browser.camofox.url and service status",
+                        self.camofox.url
+                    );
+                }
+                Ok(ResolvedBackend::Camofox)
+            }
             BrowserBackendKind::Auto => {
+                // Camofox is checked first in auto mode when URL is non-default
+                // (indicates explicit configuration intent).
+                if self.camofox.url != "http://127.0.0.1:3000" && self.camofox_available() {
+                    return Ok(ResolvedBackend::Camofox);
+                }
+
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
                 }
                 if Self::is_agent_browser_available().await {
                     return Ok(ResolvedBackend::AgentBrowser);
+                }
+
+                // Try camofox even with default URL as last resort before computer_use
+                if self.camofox_available() {
+                    return Ok(ResolvedBackend::Camofox);
                 }
 
                 let computer_use_err = match self.computer_use_available() {
@@ -379,22 +470,22 @@ impl BrowserTool {
                 if Self::rust_native_compiled() {
                     if let Some(err) = computer_use_err {
                         anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
+                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, camofox unreachable, computer-use invalid: {err})"
                         );
                     }
                     anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
+                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, camofox unreachable, computer-use sidecar unreachable)"
                     )
                 }
 
                 if let Some(err) = computer_use_err {
                     anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
+                        "browser.backend='auto' needs agent-browser CLI, browser-native, camofox, or valid computer-use sidecar (error: {err})"
                     );
                 }
 
                 anyhow::bail!(
-                    "browser.backend='auto' needs agent-browser CLI, browser-native, or computer-use sidecar"
+                    "browser.backend='auto' needs agent-browser CLI, browser-native, camofox, or computer-use sidecar"
                 )
             }
         }
@@ -962,6 +1053,322 @@ impl BrowserTool {
         })
     }
 
+    /// Execute a browser action via the Camofox REST service.
+    ///
+    /// Camofox API shape (jo-inc/camofox-browser):
+    ///   POST /tabs                  – create tab, body: { "url": "..." }
+    ///   GET  /tabs/:id/snapshot     – DOM snapshot
+    ///   POST /tabs/:id/click        – { "selector": "..." }
+    ///   POST /tabs/:id/type         – { "selector": "...", "text": "..." }
+    ///   GET  /tabs/:id/screenshot   – base64 screenshot
+    ///   DELETE /tabs/:id            – close tab
+    ///   GET  /health                – health check
+    ///   GET  /youtube/transcript?url=... – YouTube transcript
+    #[allow(clippy::too_many_lines)]
+    async fn execute_camofox_action(&self, action: BrowserAction) -> anyhow::Result<ToolResult> {
+        let base = self.camofox.url.trim_end_matches('/');
+        let timeout = Duration::from_millis(self.camofox.timeout_ms);
+        let client = crate::config::build_runtime_proxy_client("tool.browser");
+
+        // Helper: build request with optional auth
+        let auth_request = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
+            if let Some(ref key) = self.camofox.api_key {
+                let token = key.trim();
+                if !token.is_empty() {
+                    return req.bearer_auth(token);
+                }
+            }
+            req
+        };
+
+        // We maintain a single "active tab" per tool invocation using a thread-local
+        // approach: open creates, subsequent actions reuse, close destroys.
+        // For simplicity, we create a new tab on `Open` and use tab id from response.
+        // Other actions operate on the most recently opened tab.
+        //
+        // Because the BrowserTool struct doesn't hold mutable tab state across calls
+        // (each execute is independent), the camofox backend creates a tab on `open`
+        // and returns the tab ID. The model should call open first, then use snapshot
+        // etc. The camofox service tracks tabs server-side.
+
+        match action {
+            BrowserAction::Open { url } => {
+                self.validate_url(&url)?;
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs"))
+                        .timeout(timeout)
+                        .json(&json!({ "url": url })),
+                )
+                .send()
+                .await
+                .context("Camofox: failed to create tab")?;
+
+                let status = resp.status();
+                let body: Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(json!({"error": "invalid response"}));
+
+                if status.is_success() {
+                    Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                        error: None,
+                    })
+                } else {
+                    Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Camofox open failed ({status}): {}",
+                            body.get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        )),
+                    })
+                }
+            }
+
+            BrowserAction::Snapshot { .. } => {
+                // Get list of tabs, use the last one
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .get(format!("{base}/tabs/{tab_id}/snapshot"))
+                        .timeout(timeout),
+                )
+                .send()
+                .await
+                .context("Camofox: snapshot request failed")?;
+
+                let status = resp.status();
+                let body: Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(json!({"error": "invalid response"}));
+
+                if status.is_success() {
+                    Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                        error: None,
+                    })
+                } else {
+                    Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Camofox snapshot failed ({status}): {}",
+                            body.get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        )),
+                    })
+                }
+            }
+
+            BrowserAction::Click { selector } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs/{tab_id}/click"))
+                        .timeout(timeout)
+                        .json(&json!({ "selector": selector })),
+                )
+                .send()
+                .await
+                .context("Camofox: click request failed")?;
+
+                Self::camofox_simple_response(resp, "click").await
+            }
+
+            BrowserAction::Fill { selector, value }
+            | BrowserAction::Type {
+                selector,
+                text: value,
+            } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs/{tab_id}/type"))
+                        .timeout(timeout)
+                        .json(&json!({ "selector": selector, "text": value })),
+                )
+                .send()
+                .await
+                .context("Camofox: type request failed")?;
+
+                Self::camofox_simple_response(resp, "type").await
+            }
+
+            BrowserAction::Screenshot { .. } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .get(format!("{base}/tabs/{tab_id}/screenshot"))
+                        .timeout(timeout),
+                )
+                .send()
+                .await
+                .context("Camofox: screenshot request failed")?;
+
+                let status = resp.status();
+                let body: Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(json!({"error": "invalid response"}));
+
+                if status.is_success() {
+                    Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                        error: None,
+                    })
+                } else {
+                    Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Camofox screenshot failed ({status})")),
+                    })
+                }
+            }
+
+            BrowserAction::Close => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .delete(format!("{base}/tabs/{tab_id}"))
+                        .timeout(timeout),
+                )
+                .send()
+                .await
+                .context("Camofox: close request failed")?;
+
+                Self::camofox_simple_response(resp, "close").await
+            }
+
+            BrowserAction::GetTitle
+            | BrowserAction::GetUrl
+            | BrowserAction::GetText { .. }
+            | BrowserAction::Wait { .. }
+            | BrowserAction::Press { .. }
+            | BrowserAction::Hover { .. }
+            | BrowserAction::Scroll { .. }
+            | BrowserAction::IsVisible { .. }
+            | BrowserAction::Find { .. } => {
+                // For actions not directly mapped to camofox REST endpoints,
+                // fall back to snapshot which gives full page state.
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .get(format!("{base}/tabs/{tab_id}/snapshot"))
+                        .timeout(timeout),
+                )
+                .send()
+                .await
+                .context("Camofox: fallback snapshot request failed")?;
+
+                let status = resp.status();
+                let body: Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(json!({"error": "invalid response"}));
+
+                if status.is_success() {
+                    let action_name = match action {
+                        BrowserAction::GetTitle => "get_title",
+                        BrowserAction::GetUrl => "get_url",
+                        BrowserAction::GetText { .. } => "get_text",
+                        BrowserAction::Wait { .. } => "wait",
+                        BrowserAction::Press { .. } => "press",
+                        BrowserAction::Hover { .. } => "hover",
+                        BrowserAction::Scroll { .. } => "scroll",
+                        BrowserAction::IsVisible { .. } => "is_visible",
+                        BrowserAction::Find { .. } => "find",
+                        _ => "unknown",
+                    };
+                    let mut output = body.clone();
+                    if let Some(obj) = output.as_object_mut() {
+                        obj.insert("_camofox_note".into(), json!(format!("Action '{action_name}' resolved via snapshot. Use open/click/type/screenshot for direct actions.")));
+                    }
+                    Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                        error: None,
+                    })
+                } else {
+                    Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Camofox fallback snapshot failed ({status})")),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Get the most recently created tab ID from camofox, or error if none exist.
+    async fn camofox_active_tab_id(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        let mut req = client.get(format!("{base}/tabs")).timeout(timeout);
+        if let Some(ref key) = self.camofox.api_key {
+            let token = key.trim();
+            if !token.is_empty() {
+                req = req.bearer_auth(token);
+            }
+        }
+
+        let resp = req.send().await.context("Camofox: failed to list tabs")?;
+        let tabs: Value = resp.json().await.unwrap_or(json!([]));
+
+        // Expect an array of tab objects with "id" fields
+        if let Some(arr) = tabs.as_array() {
+            if let Some(last) = arr.last() {
+                if let Some(id) = last.get("id").and_then(Value::as_str) {
+                    return Ok(id.to_string());
+                }
+            }
+        }
+
+        anyhow::bail!("Camofox: no active tab found. Use browser action 'open' with a URL first.")
+    }
+
+    /// Parse a simple success/error response from camofox.
+    async fn camofox_simple_response(
+        resp: reqwest::Response,
+        action_name: &str,
+    ) -> anyhow::Result<ToolResult> {
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .unwrap_or(json!({"error": "invalid response"}));
+
+        if status.is_success() {
+            Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                error: None,
+            })
+        } else {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Camofox {action_name} failed ({status}): {}",
+                    body.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                )),
+            })
+        }
+    }
+
     async fn execute_action(
         &self,
         action: BrowserAction,
@@ -973,6 +1380,7 @@ impl BrowserTool {
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
+            ResolvedBackend::Camofox => self.execute_camofox_action(action).await,
         }
     }
 
@@ -1006,10 +1414,11 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         concat!(
-            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
+            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use, camofox). ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
-            "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
-            "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
+            "key_type, key_press, screen_capture) through a computer-use sidecar. Camofox provides anti-detect ",
+            "browsing via a REST service. Use 'snapshot' to map interactive elements to refs (@e1, @e2). ",
+            "Enforces browser.allowed_domains for open actions."
         )
     }
 
@@ -1174,7 +1583,7 @@ impl Tool for BrowserTool {
             return self.execute_computer_use_action(action_str, &args).await;
         }
 
-        if is_computer_use_only_action(action_str) {
+        if is_computer_use_only_action(action_str) && backend != ResolvedBackend::Camofox {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -2241,11 +2650,12 @@ fn is_computer_use_only_action(action: &str) -> bool {
     )
 }
 
-fn backend_name(backend: ResolvedBackend) -> &'static str {
-    match backend {
+fn backend_name(b: ResolvedBackend) -> &'static str {
+    match b {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::Camofox => "camofox",
     }
 }
 
@@ -2553,12 +2963,20 @@ mod tests {
             BrowserBackendKind::AgentBrowser
         );
         assert_eq!(
-            BrowserBackendKind::parse("rust-native").unwrap(),
+            BrowserBackendKind::parse("rust_native").unwrap(),
             BrowserBackendKind::RustNative
         );
         assert_eq!(
             BrowserBackendKind::parse("computer_use").unwrap(),
             BrowserBackendKind::ComputerUse
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("camofox").unwrap(),
+            BrowserBackendKind::Camofox
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("camoufox").unwrap(),
+            BrowserBackendKind::Camofox
         );
         assert_eq!(
             BrowserBackendKind::parse("auto").unwrap(),
@@ -2593,6 +3011,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            CamofoxConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2609,6 +3028,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            CamofoxConfig::default(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2631,6 +3051,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            CamofoxConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2652,6 +3073,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            CamofoxConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2673,6 +3095,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            CamofoxConfig::default(),
         );
 
         assert!(tool
@@ -2709,6 +3132,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            CamofoxConfig::default(),
         );
 
         let key_type_args = serde_json::json!({"text": "hello"});

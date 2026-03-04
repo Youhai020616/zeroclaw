@@ -1,0 +1,332 @@
+# syntax=docker/dockerfile:1.7
+
+# ── Dockerfile.railway ────────────────────────────────────────────
+# Railway-specific Dockerfile for ZeroClaw production deployment.
+#
+# Key differences from the main Dockerfile:
+#   - Generates a complete config.toml with all required sections
+#     (gateway, autonomy, browser, camofox) to avoid TOML parse errors.
+#   - Uses a startup script that patches config from environment variables.
+#   - Uses Debian slim runtime (not distroless) so the start script can run.
+
+# ── Stage 1: Build ────────────────────────────────────────────────
+FROM rust:1.93-slim@sha256:7e6fa79cf81be23fd45d857f75f583d80cfdbb11c91fa06180fd747fda37a61d AS builder
+
+WORKDIR /app
+ARG ZEROCLAW_CARGO_FEATURES=""
+
+# Install build dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. Copy manifests to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+# Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
+RUN mkdir -p src benches crates/robot-kit/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi
+RUN rm -rf src benches crates/robot-kit/src
+
+# 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+COPY src/ src/
+COPY benches/ benches/
+COPY crates/ crates/
+COPY firmware/ firmware/
+COPY web/ web/
+# Keep release builds resilient when frontend dist assets are not prebuilt in Git.
+RUN mkdir -p web/dist && \
+    if [ ! -f web/dist/index.html ]; then \
+      printf '%s\n' \
+        '<!doctype html>' \
+        '<html lang="en">' \
+        '  <head>' \
+        '    <meta charset="utf-8" />' \
+        '    <meta name="viewport" content="width=device-width,initial-scale=1" />' \
+        '    <title>ZeroClaw Dashboard</title>' \
+        '  </head>' \
+        '  <body>' \
+        '    <h1>ZeroClaw Dashboard Unavailable</h1>' \
+        '    <p>Frontend assets are not bundled in this build. Build the web UI to populate <code>web/dist</code>.</p>' \
+        '  </body>' \
+        '</html>' > web/dist/index.html; \
+    fi
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi && \
+    cp target/release/zeroclaw /app/zeroclaw && \
+    strip /app/zeroclaw
+
+# Prepare runtime directory structure and complete default config.
+# This config includes ALL required sections with sane defaults so the
+# TOML deserializer never fails on missing required fields.
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+    cat > /zeroclaw-data/.zeroclaw/config.toml <<'CONFIGEOF'
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7
+
+[gateway]
+port = 42617
+host = "0.0.0.0"
+allow_public_bind = true
+require_pairing = true
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date"]
+forbidden_paths = ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp", "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"]
+max_actions_per_hour = 100
+max_cost_per_day_cents = 1000
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+auto_approve = ["file_read", "memory_recall"]
+always_ask = []
+allowed_roots = []
+shell_env_passthrough = []
+# browser and browser_open are intentionally NOT excluded here so that
+# non-CLI channels (Telegram, Discord) can use the browser tool.
+non_cli_excluded_tools = [
+    "shell",
+    "file_write",
+    "file_edit",
+    "git_operations",
+    "http_request",
+    "schedule",
+    "cron_add",
+    "cron_remove",
+    "cron_update",
+    "cron_run",
+    "memory_store",
+    "memory_forget",
+    "proxy_config",
+    "model_routing_config",
+    "pushover",
+    "composio",
+    "delegate",
+    "screenshot",
+    "image_info",
+]
+
+[browser]
+enabled = true
+allowed_domains = ["*"]
+backend = "camofox"
+browser_open = "default"
+native_headless = true
+native_webdriver_url = "http://127.0.0.1:9515"
+
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+allow_remote_endpoint = false
+
+[browser.camofox]
+url = "http://127.0.0.1:3000"
+timeout_ms = 30000
+
+[memory]
+backend = "markdown"
+auto_save = true
+
+[observability]
+backend = "file"
+
+[security]
+
+[security.sandbox]
+enabled = false
+backend = "none"
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 300
+max_subprocesses = 10
+
+[security.audit]
+enabled = true
+log_path = "/zeroclaw-data/.zeroclaw/audit.log"
+max_size_mb = 50
+
+[runtime]
+kind = "native"
+
+[reliability]
+provider_retries = 3
+provider_backoff_ms = 1000
+channel_initial_backoff_secs = 5
+channel_max_backoff_secs = 300
+scheduler_poll_secs = 60
+scheduler_retries = 3
+
+[scheduler]
+enabled = true
+max_tasks = 100
+max_concurrent = 5
+
+[agent]
+compact_context = false
+max_tool_iterations = 25
+max_history_messages = 50
+parallel_tools = false
+tool_dispatcher = "sequential"
+
+[web_search]
+enabled = false
+provider = "brave"
+max_results = 5
+timeout_secs = 10
+
+[web_fetch]
+enabled = true
+provider = "html2md"
+max_response_size = 1048576
+timeout_secs = 30
+
+[http_request]
+enabled = false
+
+[multimodal]
+max_images = 5
+max_image_size_mb = 10
+allow_remote_fetch = true
+
+[cost]
+enabled = false
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+[proxy]
+enabled = false
+
+[tunnel]
+
+[composio]
+enabled = false
+
+[secrets]
+encrypt = true
+
+[heartbeat]
+enabled = false
+
+[cron]
+enabled = true
+max_run_history = 100
+
+[goal_loop]
+enabled = false
+
+[research]
+enabled = false
+
+[skills]
+open_skills_enabled = false
+
+[identity]
+format = "default"
+
+[hooks]
+enabled = false
+CONFIGEOF
+RUN chown -R 65534:65534 /zeroclaw-data
+
+# Create the startup script that patches config from Railway env vars at boot.
+RUN cat > /start.sh <<'STARTEOF'
+#!/bin/sh
+set -e
+
+CONFIG="/zeroclaw-data/.zeroclaw/config.toml"
+
+# ── Patch config.toml from environment variables ──────────────
+
+# Provider / model
+if [ -n "$PROVIDER" ] || [ -n "$ZEROCLAW_PROVIDER" ]; then
+    PROV="${ZEROCLAW_PROVIDER:-$PROVIDER}"
+    sed -i "s|^default_provider = .*|default_provider = \"${PROV}\"|" "$CONFIG"
+fi
+
+if [ -n "$ZEROCLAW_MODEL" ]; then
+    sed -i "s|^default_model = .*|default_model = \"${ZEROCLAW_MODEL}\"|" "$CONFIG"
+fi
+
+# Gateway port (Railway assigns $PORT)
+if [ -n "$PORT" ] || [ -n "$ZEROCLAW_GATEWAY_PORT" ]; then
+    GW_PORT="${ZEROCLAW_GATEWAY_PORT:-$PORT}"
+    sed -i "s|^port = 42617|port = ${GW_PORT}|" "$CONFIG"
+fi
+
+# Camofox URL
+if [ -n "$ZEROCLAW_CAMOFOX_URL" ]; then
+    sed -i "s|^url = \"http://127.0.0.1:3000\"|url = \"${ZEROCLAW_CAMOFOX_URL}\"|" "$CONFIG"
+fi
+
+# Browser backend override
+if [ -n "$ZEROCLAW_BROWSER_BACKEND" ]; then
+    sed -i "s|^backend = \"camofox\"|backend = \"${ZEROCLAW_BROWSER_BACKEND}\"|" "$CONFIG"
+fi
+
+# Browser enabled override
+if [ -n "$ZEROCLAW_BROWSER_ENABLED" ]; then
+    case "$ZEROCLAW_BROWSER_ENABLED" in
+        1|true|yes|on) sed -i "s|^enabled = false|enabled = true|; /^\[browser\]/{n;s|enabled = .*|enabled = true|;}" "$CONFIG" ;;
+        0|false|no|off) sed -i "/^\[browser\]/{n;s|enabled = .*|enabled = false|;}" "$CONFIG" ;;
+    esac
+fi
+
+echo "=== ZeroClaw Railway startup ==="
+echo "Config: $CONFIG"
+echo "Provider: ${ZEROCLAW_PROVIDER:-${PROVIDER:-openrouter}}"
+echo "Model: ${ZEROCLAW_MODEL:-default}"
+echo "Browser backend: ${ZEROCLAW_BROWSER_BACKEND:-camofox}"
+echo "Camofox URL: ${ZEROCLAW_CAMOFOX_URL:-http://127.0.0.1:3000}"
+echo "================================"
+
+exec zeroclaw gateway
+STARTEOF
+RUN chmod +x /start.sh
+
+# ── Stage 2: Production Runtime ───────────────────────────────
+FROM debian:bookworm-slim AS release
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /zeroclaw-data /zeroclaw-data
+COPY --from=builder /start.sh /start.sh
+
+# Environment setup
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_GATEWAY_PORT=42617
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+EXPOSE 42617
+
+ENTRYPOINT ["/start.sh"]

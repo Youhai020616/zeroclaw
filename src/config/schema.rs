@@ -1212,7 +1212,7 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
+    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "camofox" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
     /// Headless mode for rust-native backend
@@ -1227,6 +1227,45 @@ pub struct BrowserConfig {
     /// Computer-use sidecar configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
+    /// Camofox REST browser service configuration
+    #[serde(default)]
+    pub camofox: BrowserCamofoxConfig,
+}
+
+/// Camofox remote browser service configuration (`[browser.camofox]`).
+///
+/// Camofox wraps Camoufox (anti-detect Firefox) in a REST API for headless
+/// browsing.  ZeroClaw talks to it over HTTP, creating tabs and issuing
+/// snapshot / click / type / screenshot actions.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserCamofoxConfig {
+    /// Base URL of the camofox-browser service (e.g. `http://camofox-browser.railway.internal:3000`)
+    #[serde(default = "default_camofox_url")]
+    pub url: String,
+    /// Optional Bearer token for camofox-browser authentication
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Request timeout in milliseconds. Default: `30000` (30 s).
+    #[serde(default = "default_camofox_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_camofox_url() -> String {
+    "http://127.0.0.1:3000".into()
+}
+
+fn default_camofox_timeout_ms() -> u64 {
+    30_000
+}
+
+impl Default for BrowserCamofoxConfig {
+    fn default() -> Self {
+        Self {
+            url: default_camofox_url(),
+            api_key: None,
+            timeout_ms: default_camofox_timeout_ms(),
+        }
+    }
 }
 
 fn default_browser_backend() -> String {
@@ -1253,6 +1292,7 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+            camofox: BrowserCamofoxConfig::default(),
         }
     }
 }
@@ -6270,6 +6310,56 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // Browser enabled: ZEROCLAW_BROWSER_ENABLED
+        if let Ok(val) = std::env::var("ZEROCLAW_BROWSER_ENABLED") {
+            self.browser.enabled = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
+        // Browser backend: ZEROCLAW_BROWSER_BACKEND
+        if let Ok(backend) = std::env::var("ZEROCLAW_BROWSER_BACKEND") {
+            let backend = backend.trim();
+            if !backend.is_empty() {
+                self.browser.backend = backend.to_string();
+            }
+        }
+
+        // Browser allowed domains: ZEROCLAW_BROWSER_ALLOWED_DOMAINS (comma-separated)
+        if let Ok(domains) = std::env::var("ZEROCLAW_BROWSER_ALLOWED_DOMAINS") {
+            let domains: Vec<String> = domains
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !domains.is_empty() {
+                self.browser.allowed_domains = domains;
+            }
+        }
+
+        // Camofox URL: ZEROCLAW_CAMOFOX_URL
+        if let Ok(url) = std::env::var("ZEROCLAW_CAMOFOX_URL") {
+            let url = url.trim();
+            if !url.is_empty() {
+                self.browser.camofox.url = url.to_string();
+            }
+        }
+
+        // Camofox API key: ZEROCLAW_CAMOFOX_API_KEY
+        if let Ok(key) = std::env::var("ZEROCLAW_CAMOFOX_API_KEY") {
+            let key = key.trim();
+            if !key.is_empty() {
+                self.browser.camofox.api_key = Some(key.to_string());
+            }
+        }
+
+        // Camofox timeout: ZEROCLAW_CAMOFOX_TIMEOUT_MS
+        if let Ok(timeout) = std::env::var("ZEROCLAW_CAMOFOX_TIMEOUT_MS") {
+            if let Ok(ms) = timeout.parse::<u64>() {
+                if ms > 0 {
+                    self.browser.camofox.timeout_ms = ms;
+                }
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -8353,6 +8443,7 @@ default_temperature = 0.7
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
+            camofox: BrowserCamofoxConfig::default(),
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
