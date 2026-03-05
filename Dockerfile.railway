@@ -129,6 +129,15 @@ backend = "camofox"
 url = "http://127.0.0.1:3000"
 timeout_ms = 30000
 
+# Channels: cli is required (no serde default), telegram uses placeholder
+# that start.sh will replace from env vars before exec.
+[channels_config]
+cli = false
+
+[channels_config.telegram]
+bot_token = "__TELEGRAM_BOT_TOKEN__"
+allowed_users = ["__TELEGRAM_ALLOWED_USERS__"]
+
 # All other sections (memory, observability, security, runtime,
 # reliability, scheduler, agent, web_search, web_fetch, http_request,
 # multimodal, cost, proxy, tunnel, composio, secrets, heartbeat,
@@ -180,23 +189,19 @@ if [ -n "$ZEROCLAW_BROWSER_ENABLED" ]; then
     esac
 fi
 
-# Telegram channel — inject [channels_config.telegram] from env vars
+# Telegram channel — replace placeholders in config from env vars
 TG_TOKEN="${ZEROCLAW_TELEGRAM_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
 if [ -n "$TG_TOKEN" ]; then
-    TG_USERS="${ZEROCLAW_TELEGRAM_ALLOWED_USERS:-}"
-    # Build allowed_users array: split comma-separated values into TOML array
-    if [ -n "$TG_USERS" ]; then
-        TG_USERS_TOML=$(echo "$TG_USERS" | sed 's/,/", "/g; s/^/"/; s/$/"/')
-    else
-        TG_USERS_TOML='"*"'
-    fi
-    cat >> "$CONFIG" <<TGEOF
-
-[channels_config.telegram]
-bot_token = "${TG_TOKEN}"
-allowed_users = [${TG_USERS_TOML}]
-TGEOF
-    echo "Telegram: enabled (allowed_users: [${TG_USERS_TOML}])"
+    sed -i "s|__TELEGRAM_BOT_TOKEN__|${TG_TOKEN}|" "$CONFIG"
+    TG_USERS="${ZEROCLAW_TELEGRAM_ALLOWED_USERS:-*}"
+    # Replace the placeholder with actual allowed users (comma-sep → TOML array entries)
+    TG_USERS_TOML=$(echo "$TG_USERS" | sed 's/,/", "/g')
+    sed -i "s|__TELEGRAM_ALLOWED_USERS__|${TG_USERS_TOML}|" "$CONFIG"
+    echo "Telegram: enabled (allowed_users: [\"${TG_USERS_TOML}\"])"
+else
+    # No token — remove the telegram section entirely so channel is not started
+    sed -i '/^\[channels_config\.telegram\]/,/^$/d' "$CONFIG"
+    echo "Telegram: not configured (no bot token)"
 fi
 
 echo "=== ZeroClaw Railway startup ==="
@@ -205,7 +210,7 @@ echo "Provider: ${ZEROCLAW_PROVIDER:-${PROVIDER:-openrouter}}"
 echo "Model: ${ZEROCLAW_MODEL:-default}"
 echo "Browser backend: ${ZEROCLAW_BROWSER_BACKEND:-camofox}"
 echo "Camofox URL: ${ZEROCLAW_CAMOFOX_URL:-http://127.0.0.1:3000}"
-echo "Telegram: ${TG_TOKEN:+configured}${TG_TOKEN:-not configured}"
+
 echo "================================"
 
 exec zeroclaw gateway
