@@ -301,7 +301,7 @@ STARTEOF
 RUN chmod +x /start.sh
 
 # ── Stage 2: Production Runtime ───────────────────────────────
-FROM debian:bookworm-slim AS release
+FROM debian:trixie-slim AS release
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
