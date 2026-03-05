@@ -149,9 +149,14 @@ RUN chown -R 65534:65534 /zeroclaw-data
 # Create the startup script that patches config from Railway env vars at boot.
 RUN cat > /start.sh <<'STARTEOF'
 #!/bin/sh
-set -e
 
 CONFIG="/zeroclaw-data/.zeroclaw/config.toml"
+
+echo "[start.sh] Starting config patching..."
+echo "[start.sh] Config file: $CONFIG"
+ls -la "$CONFIG" 2>&1 || echo "[start.sh] ERROR: config file not found"
+echo "[start.sh] Config dir:"
+ls -la "$(dirname "$CONFIG")" 2>&1
 
 # ── Patch config.toml from environment variables ──────────────
 
@@ -191,16 +196,18 @@ fi
 
 # Telegram channel — replace placeholders in config from env vars
 TG_TOKEN="${ZEROCLAW_TELEGRAM_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+echo "[start.sh] TG_TOKEN set: $([ -n "$TG_TOKEN" ] && echo 'yes' || echo 'no')"
 if [ -n "$TG_TOKEN" ]; then
-    sed -i "s|__TELEGRAM_BOT_TOKEN__|${TG_TOKEN}|" "$CONFIG"
+    echo "[start.sh] Patching telegram bot_token placeholder..."
+    sed -i "s|__TELEGRAM_BOT_TOKEN__|${TG_TOKEN}|" "$CONFIG" && echo "[start.sh] bot_token replaced" || echo "[start.sh] ERROR: bot_token sed failed"
     TG_USERS="${ZEROCLAW_TELEGRAM_ALLOWED_USERS:-*}"
     # Replace the placeholder with actual allowed users (comma-sep → TOML array entries)
     TG_USERS_TOML=$(echo "$TG_USERS" | sed 's/,/", "/g')
-    sed -i "s|__TELEGRAM_ALLOWED_USERS__|${TG_USERS_TOML}|" "$CONFIG"
+    sed -i "s|__TELEGRAM_ALLOWED_USERS__|${TG_USERS_TOML}|" "$CONFIG" && echo "[start.sh] allowed_users replaced" || echo "[start.sh] ERROR: allowed_users sed failed"
     echo "Telegram: enabled (allowed_users: [\"${TG_USERS_TOML}\"])"
 else
     # No token — remove the telegram section entirely so channel is not started
-    sed -i '/^\[channels_config\.telegram\]/,/^$/d' "$CONFIG"
+    sed -i '/^\[channels_config\.telegram\]/,/^$/d' "$CONFIG" || echo "[start.sh] WARN: telegram section removal failed"
     echo "Telegram: not configured (no bot token)"
 fi
 
@@ -212,6 +219,11 @@ echo "Browser backend: ${ZEROCLAW_BROWSER_BACKEND:-camofox}"
 echo "Camofox URL: ${ZEROCLAW_CAMOFOX_URL:-http://127.0.0.1:3000}"
 
 echo "================================"
+
+echo "[start.sh] Final config content:"
+cat "$CONFIG"
+echo "[start.sh] --- end config ---"
+echo "[start.sh] Launching: zeroclaw gateway"
 
 exec zeroclaw gateway
 STARTEOF
