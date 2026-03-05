@@ -223,9 +223,9 @@ echo "================================"
 echo "[start.sh] Final config content:"
 cat "$CONFIG"
 echo "[start.sh] --- end config ---"
-echo "[start.sh] Launching: zeroclaw gateway"
+echo "[start.sh] Launching: zeroclaw daemon"
 
-exec zeroclaw start
+exec zeroclaw daemon
 STARTEOF
 RUN chmod +x /start.sh
 
