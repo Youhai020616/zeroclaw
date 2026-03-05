@@ -433,7 +433,7 @@ Notes:
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs in the system browser without scraping) |
 | `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
-| `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
+| `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, `"camofox"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
 | `native_webdriver_url` | `http://127.0.0.1:9515` | WebDriver endpoint URL for rust-native backend |
 | `native_chrome_path` | unset | Optional Chrome/Chromium executable path for rust-native backend |
@@ -455,6 +455,24 @@ Notes:
 - When `backend = "computer_use"`, the agent delegates browser actions to the sidecar at `computer_use.endpoint`.
 - `allow_remote_endpoint = false` (default) rejects any non-loopback endpoint to prevent accidental public exposure.
 - Use `window_allowlist` to restrict which OS windows the sidecar can interact with.
+
+### `[browser.camofox]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `url` | `http://127.0.0.1:3000` | Base URL of the camofox-browser REST service |
+| `api_key` | unset | Optional Bearer token for camofox-browser authentication (stored encrypted) |
+| `timeout_ms` | `30000` | Per-request timeout in milliseconds |
+| `user_id` | `zeroclaw` | User ID sent to camofox for session isolation |
+| `session_key` | `default` | Session key sent to camofox for tab grouping |
+
+Notes:
+
+- When `backend = "camofox"`, the agent delegates browser actions to a [camofox-browser](https://github.com/jo-inc/camofox-browser) REST service.
+- Camofox wraps Camoufox (an anti-detect Firefox fork) in a REST API with accessibility snapshots, element refs, and search macros.
+- The camofox API requires `userId` and `sessionKey` on every request for session isolation and tab grouping. The `user_id` and `session_key` config fields map to these.
+- For Railway/Docker deployments, set `ZEROCLAW_CAMOFOX_URL` to the internal service URL (e.g. `http://camofox-browser.railway.internal:9377`).
+- Environment variable overrides: `ZEROCLAW_CAMOFOX_URL`, `ZEROCLAW_CAMOFOX_API_KEY`, `ZEROCLAW_CAMOFOX_TIMEOUT_MS`, `ZEROCLAW_CAMOFOX_USER_ID`, `ZEROCLAW_CAMOFOX_SESSION_KEY`.
 
 ## `[http_request]`
 

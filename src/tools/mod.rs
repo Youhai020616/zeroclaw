@@ -340,6 +340,8 @@ pub fn all_tools_with_runtime(
                 url: browser_config.camofox.url.clone(),
                 api_key: browser_config.camofox.api_key.clone(),
                 timeout_ms: browser_config.camofox.timeout_ms,
+                user_id: browser_config.camofox.user_id.clone(),
+                session_key: browser_config.camofox.session_key.clone(),
             },
         )));
     }

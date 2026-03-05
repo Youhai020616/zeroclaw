@@ -10,6 +10,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
@@ -61,6 +62,9 @@ impl Default for ComputerUseConfig {
 }
 
 /// Camofox remote browser service settings.
+///
+/// The camofox API requires `userId` (session isolation) and `sessionKey`
+/// (tab grouping) on every request.  Defaults are `"zeroclaw"` / `"default"`.
 #[derive(Clone)]
 pub struct CamofoxConfig {
     /// Base URL of the camofox-browser REST service.
@@ -69,6 +73,10 @@ pub struct CamofoxConfig {
     pub api_key: Option<String>,
     /// Request timeout in milliseconds.
     pub timeout_ms: u64,
+    /// User ID sent to camofox for session isolation.
+    pub user_id: String,
+    /// Session key sent to camofox for tab grouping.
+    pub session_key: String,
 }
 
 impl std::fmt::Debug for CamofoxConfig {
@@ -76,6 +84,8 @@ impl std::fmt::Debug for CamofoxConfig {
         f.debug_struct("CamofoxConfig")
             .field("url", &self.url)
             .field("timeout_ms", &self.timeout_ms)
+            .field("user_id", &self.user_id)
+            .field("session_key", &self.session_key)
             .finish_non_exhaustive()
     }
 }
@@ -86,6 +96,8 @@ impl Default for CamofoxConfig {
             url: "http://127.0.0.1:3000".into(),
             api_key: None,
             timeout_ms: 30_000,
+            user_id: "zeroclaw".into(),
+            session_key: "default".into(),
         }
     }
 }
@@ -393,7 +405,7 @@ impl BrowserTool {
     fn camofox_available(&self) -> bool {
         let url_str = format!("{}/health", self.camofox.url.trim_end_matches('/'));
         match reqwest::Url::parse(&url_str) {
-            Ok(url) => endpoint_reachable(&url, Duration::from_millis(500)),
+            Ok(url) => endpoint_reachable(&url, Duration::from_millis(2000)),
             Err(_) => false,
         }
     }
@@ -1069,6 +1081,8 @@ impl BrowserTool {
         let base = self.camofox.url.trim_end_matches('/');
         let timeout = Duration::from_millis(self.camofox.timeout_ms);
         let client = crate::config::build_runtime_proxy_client("tool.browser");
+        let user_id = &self.camofox.user_id;
+        let session_key = &self.camofox.session_key;
 
         // Helper: build request with optional auth
         let auth_request = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
@@ -1081,25 +1095,22 @@ impl BrowserTool {
             req
         };
 
-        // We maintain a single "active tab" per tool invocation using a thread-local
-        // approach: open creates, subsequent actions reuse, close destroys.
-        // For simplicity, we create a new tab on `Open` and use tab id from response.
-        // Other actions operate on the most recently opened tab.
-        //
-        // Because the BrowserTool struct doesn't hold mutable tab state across calls
-        // (each execute is independent), the camofox backend creates a tab on `open`
-        // and returns the tab ID. The model should call open first, then use snapshot
-        // etc. The camofox service tracks tabs server-side.
+        // Camofox API contract:
+        //   - POST bodies must include `userId` and `sessionKey` for session isolation.
+        //   - GET query params must include `userId`.
+        //   - Click/type accept `ref` (element refs like "e1") OR `selector` (CSS).
+        //   - Tab IDs are UUIDs returned by `POST /tabs`.
 
         match action {
             BrowserAction::Open { url } => {
                 self.validate_url(&url)?;
-                let resp = auth_request(
-                    client
-                        .post(format!("{base}/tabs"))
-                        .timeout(timeout)
-                        .json(&json!({ "url": url })),
-                )
+                let resp = auth_request(client.post(format!("{base}/tabs")).timeout(timeout).json(
+                    &json!({
+                        "userId": user_id,
+                        "sessionKey": session_key,
+                        "url": url,
+                    }),
+                ))
                 .send()
                 .await
                 .context("Camofox: failed to create tab")?;
@@ -1131,11 +1142,11 @@ impl BrowserTool {
             }
 
             BrowserAction::Snapshot { .. } => {
-                // Get list of tabs, use the last one
                 let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
                 let resp = auth_request(
                     client
                         .get(format!("{base}/tabs/{tab_id}/snapshot"))
+                        .query(&[("userId", user_id.as_str())])
                         .timeout(timeout),
                 )
                 .send()
@@ -1170,11 +1181,21 @@ impl BrowserTool {
 
             BrowserAction::Click { selector } => {
                 let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                // Camofox accepts `ref` (e.g. "e1") or `selector` (CSS).
+                // If the selector looks like an element ref (e<digits>), send as ref.
+                let body = if selector.starts_with('e')
+                    && selector[1..].chars().all(|c| c.is_ascii_digit())
+                    && selector.len() > 1
+                {
+                    json!({ "userId": user_id, "ref": selector })
+                } else {
+                    json!({ "userId": user_id, "selector": selector })
+                };
                 let resp = auth_request(
                     client
                         .post(format!("{base}/tabs/{tab_id}/click"))
                         .timeout(timeout)
-                        .json(&json!({ "selector": selector })),
+                        .json(&body),
                 )
                 .send()
                 .await
@@ -1189,11 +1210,20 @@ impl BrowserTool {
                 text: value,
             } => {
                 let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                // Same ref-vs-selector detection as click.
+                let body = if selector.starts_with('e')
+                    && selector[1..].chars().all(|c| c.is_ascii_digit())
+                    && selector.len() > 1
+                {
+                    json!({ "userId": user_id, "ref": selector, "text": value })
+                } else {
+                    json!({ "userId": user_id, "selector": selector, "text": value })
+                };
                 let resp = auth_request(
                     client
                         .post(format!("{base}/tabs/{tab_id}/type"))
                         .timeout(timeout)
-                        .json(&json!({ "selector": selector, "text": value })),
+                        .json(&body),
                 )
                 .send()
                 .await
@@ -1207,6 +1237,7 @@ impl BrowserTool {
                 let resp = auth_request(
                     client
                         .get(format!("{base}/tabs/{tab_id}/screenshot"))
+                        .query(&[("userId", user_id.as_str())])
                         .timeout(timeout),
                 )
                 .send()
@@ -1214,23 +1245,44 @@ impl BrowserTool {
                 .context("Camofox: screenshot request failed")?;
 
                 let status = resp.status();
-                let body: Value = resp
-                    .json()
-                    .await
-                    .unwrap_or(json!({"error": "invalid response"}));
+                // Screenshot endpoint may return raw PNG or JSON depending on camofox version.
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
 
-                if status.is_success() {
+                if status.is_success() && content_type.contains("image/") {
+                    // Raw binary screenshot — encode as base64 for the tool result.
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     Ok(ToolResult {
                         success: true,
-                        output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                        output: serde_json::to_string_pretty(&json!({
+                            "screenshot": { "data": b64, "mimeType": content_type },
+                        }))
+                        .unwrap_or_default(),
                         error: None,
                     })
                 } else {
-                    Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Camofox screenshot failed ({status})")),
-                    })
+                    let body: Value = resp
+                        .json()
+                        .await
+                        .unwrap_or(json!({"error": "invalid response"}));
+                    if status.is_success() {
+                        Ok(ToolResult {
+                            success: true,
+                            output: serde_json::to_string_pretty(&body).unwrap_or_default(),
+                            error: None,
+                        })
+                    } else {
+                        Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Camofox screenshot failed ({status})")),
+                        })
+                    }
                 }
             }
 
@@ -1239,7 +1291,8 @@ impl BrowserTool {
                 let resp = auth_request(
                     client
                         .delete(format!("{base}/tabs/{tab_id}"))
-                        .timeout(timeout),
+                        .timeout(timeout)
+                        .json(&json!({ "userId": user_id })),
                 )
                 .send()
                 .await
@@ -1248,13 +1301,68 @@ impl BrowserTool {
                 Self::camofox_simple_response(resp, "close").await
             }
 
+            BrowserAction::Press { key } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs/{tab_id}/press"))
+                        .timeout(timeout)
+                        .json(&json!({ "userId": user_id, "key": key })),
+                )
+                .send()
+                .await
+                .context("Camofox: press request failed")?;
+
+                Self::camofox_simple_response(resp, "press").await
+            }
+
+            BrowserAction::Scroll { direction, pixels } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let dir = direction.as_str();
+                let amount = pixels.unwrap_or(500);
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs/{tab_id}/scroll"))
+                        .timeout(timeout)
+                        .json(&json!({
+                            "userId": user_id,
+                            "direction": dir,
+                            "amount": amount,
+                        })),
+                )
+                .send()
+                .await
+                .context("Camofox: scroll request failed")?;
+
+                Self::camofox_simple_response(resp, "scroll").await
+            }
+
+            BrowserAction::Wait { selector, ms, .. } => {
+                let tab_id = self.camofox_active_tab_id(&client, base, timeout).await?;
+                let mut body = json!({ "userId": user_id });
+                if let Some(sel) = selector {
+                    body["selector"] = json!(sel);
+                }
+                if let Some(timeout_ms) = ms {
+                    body["timeout"] = json!(timeout_ms);
+                }
+                let resp = auth_request(
+                    client
+                        .post(format!("{base}/tabs/{tab_id}/wait"))
+                        .timeout(timeout)
+                        .json(&body),
+                )
+                .send()
+                .await
+                .context("Camofox: wait request failed")?;
+
+                Self::camofox_simple_response(resp, "wait").await
+            }
+
             BrowserAction::GetTitle
             | BrowserAction::GetUrl
             | BrowserAction::GetText { .. }
-            | BrowserAction::Wait { .. }
-            | BrowserAction::Press { .. }
             | BrowserAction::Hover { .. }
-            | BrowserAction::Scroll { .. }
             | BrowserAction::IsVisible { .. }
             | BrowserAction::Find { .. } => {
                 // For actions not directly mapped to camofox REST endpoints,
@@ -1263,6 +1371,7 @@ impl BrowserTool {
                 let resp = auth_request(
                     client
                         .get(format!("{base}/tabs/{tab_id}/snapshot"))
+                        .query(&[("userId", user_id.as_str())])
                         .timeout(timeout),
                 )
                 .send()
@@ -1280,10 +1389,7 @@ impl BrowserTool {
                         BrowserAction::GetTitle => "get_title",
                         BrowserAction::GetUrl => "get_url",
                         BrowserAction::GetText { .. } => "get_text",
-                        BrowserAction::Wait { .. } => "wait",
-                        BrowserAction::Press { .. } => "press",
                         BrowserAction::Hover { .. } => "hover",
-                        BrowserAction::Scroll { .. } => "scroll",
                         BrowserAction::IsVisible { .. } => "is_visible",
                         BrowserAction::Find { .. } => "find",
                         _ => "unknown",
@@ -1315,7 +1421,10 @@ impl BrowserTool {
         base: &str,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        let mut req = client.get(format!("{base}/tabs")).timeout(timeout);
+        let mut req = client
+            .get(format!("{base}/tabs"))
+            .query(&[("userId", self.camofox.user_id.as_str())])
+            .timeout(timeout);
         if let Some(ref key) = self.camofox.api_key {
             let token = key.trim();
             if !token.is_empty() {
@@ -1324,12 +1433,34 @@ impl BrowserTool {
         }
 
         let resp = req.send().await.context("Camofox: failed to list tabs")?;
-        let tabs: Value = resp.json().await.unwrap_or(json!([]));
+        let body: Value = resp.json().await.unwrap_or(json!({}));
 
-        // Expect an array of tab objects with "id" fields
-        if let Some(arr) = tabs.as_array() {
+        // Camofox GET /tabs returns `{ running: bool, tabs: [...] }`.
+        // Each tab has `tabId` (or `targetId`) and `url`.
+        let tabs = body.get("tabs").and_then(Value::as_array);
+        if let Some(arr) = tabs {
             if let Some(last) = arr.last() {
-                if let Some(id) = last.get("id").and_then(Value::as_str) {
+                // Accept both `tabId` and `id` / `targetId` field names.
+                let id = last
+                    .get("tabId")
+                    .or_else(|| last.get("targetId"))
+                    .or_else(|| last.get("id"))
+                    .and_then(Value::as_str);
+                if let Some(id) = id {
+                    return Ok(id.to_string());
+                }
+            }
+        }
+
+        // Fallback: maybe the response is a bare array (older camofox versions).
+        if let Some(arr) = body.as_array() {
+            if let Some(last) = arr.last() {
+                let id = last
+                    .get("tabId")
+                    .or_else(|| last.get("targetId"))
+                    .or_else(|| last.get("id"))
+                    .and_then(Value::as_str);
+                if let Some(id) = id {
                     return Ok(id.to_string());
                 }
             }

@@ -128,6 +128,8 @@ backend = "camofox"
 [browser.camofox]
 url = "http://127.0.0.1:3000"
 timeout_ms = 30000
+user_id = "zeroclaw"
+session_key = "default"
 
 # Channels: cli is required (no serde default), telegram uses placeholder
 # that start.sh will replace from env vars before exec.
@@ -144,86 +146,85 @@ allowed_users = ["__TELEGRAM_ALLOWED_USERS__"]
 # cron, goal_loop, research, skills, identity, hooks) are
 # intentionally OMITTED so they use safe built-in defaults.
 CONFIGEOF
-RUN chown -R 65534:65534 /zeroclaw-data
+RUN chmod 600 /zeroclaw-data/.zeroclaw/config.toml && \
+    chown -R 65534:65534 /zeroclaw-data
 
 # Create the startup script that patches config from Railway env vars at boot.
 RUN cat > /start.sh <<'STARTEOF'
 #!/bin/sh
+set -eu
 
 CONFIG="/zeroclaw-data/.zeroclaw/config.toml"
 
-echo "[start.sh] Starting config patching..."
-echo "[start.sh] Config file: $CONFIG"
-ls -la "$CONFIG" 2>&1 || echo "[start.sh] ERROR: config file not found"
-echo "[start.sh] Config dir:"
-ls -la "$(dirname "$CONFIG")" 2>&1
+if [ ! -f "$CONFIG" ]; then
+    echo "FATAL: config file not found at $CONFIG" >&2
+    exit 1
+fi
 
 # ── Patch config.toml from environment variables ──────────────
 
 # Provider / model
-if [ -n "$PROVIDER" ] || [ -n "$ZEROCLAW_PROVIDER" ]; then
+if [ -n "${ZEROCLAW_PROVIDER:-${PROVIDER:-}}" ]; then
     PROV="${ZEROCLAW_PROVIDER:-$PROVIDER}"
     sed -i "s|^default_provider = .*|default_provider = \"${PROV}\"|" "$CONFIG"
 fi
 
-if [ -n "$ZEROCLAW_MODEL" ]; then
+if [ -n "${ZEROCLAW_MODEL:-}" ]; then
     sed -i "s|^default_model = .*|default_model = \"${ZEROCLAW_MODEL}\"|" "$CONFIG"
 fi
 
 # Gateway port (Railway assigns $PORT)
-if [ -n "$PORT" ] || [ -n "$ZEROCLAW_GATEWAY_PORT" ]; then
+if [ -n "${ZEROCLAW_GATEWAY_PORT:-${PORT:-}}" ]; then
     GW_PORT="${ZEROCLAW_GATEWAY_PORT:-$PORT}"
     sed -i "s|^port = 42617|port = ${GW_PORT}|" "$CONFIG"
 fi
 
 # Camofox URL
-if [ -n "$ZEROCLAW_CAMOFOX_URL" ]; then
+if [ -n "${ZEROCLAW_CAMOFOX_URL:-}" ]; then
     sed -i "s|^url = \"http://127.0.0.1:3000\"|url = \"${ZEROCLAW_CAMOFOX_URL}\"|" "$CONFIG"
 fi
 
 # Browser backend override
-if [ -n "$ZEROCLAW_BROWSER_BACKEND" ]; then
+if [ -n "${ZEROCLAW_BROWSER_BACKEND:-}" ]; then
     sed -i "s|^backend = \"camofox\"|backend = \"${ZEROCLAW_BROWSER_BACKEND}\"|" "$CONFIG"
 fi
 
 # Browser enabled override
-if [ -n "$ZEROCLAW_BROWSER_ENABLED" ]; then
+if [ -n "${ZEROCLAW_BROWSER_ENABLED:-}" ]; then
     case "$ZEROCLAW_BROWSER_ENABLED" in
         1|true|yes|on) sed -i "s|^enabled = false|enabled = true|; /^\[browser\]/{n;s|enabled = .*|enabled = true|;}" "$CONFIG" ;;
         0|false|no|off) sed -i "/^\[browser\]/{n;s|enabled = .*|enabled = false|;}" "$CONFIG" ;;
     esac
 fi
 
+# Camofox user_id / session_key overrides
+if [ -n "${ZEROCLAW_CAMOFOX_USER_ID:-}" ]; then
+    sed -i "s|^user_id = \"zeroclaw\"|user_id = \"${ZEROCLAW_CAMOFOX_USER_ID}\"|" "$CONFIG"
+fi
+if [ -n "${ZEROCLAW_CAMOFOX_SESSION_KEY:-}" ]; then
+    sed -i "s|^session_key = \"default\"|session_key = \"${ZEROCLAW_CAMOFOX_SESSION_KEY}\"|" "$CONFIG"
+fi
+
 # Telegram channel — replace placeholders in config from env vars
-TG_TOKEN="${ZEROCLAW_TELEGRAM_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
-echo "[start.sh] TG_TOKEN set: $([ -n "$TG_TOKEN" ] && echo 'yes' || echo 'no')"
+TG_TOKEN="${ZEROCLAW_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}"
 if [ -n "$TG_TOKEN" ]; then
-    echo "[start.sh] Patching telegram bot_token placeholder..."
-    sed -i "s|__TELEGRAM_BOT_TOKEN__|${TG_TOKEN}|" "$CONFIG" && echo "[start.sh] bot_token replaced" || echo "[start.sh] ERROR: bot_token sed failed"
+    sed -i "s|__TELEGRAM_BOT_TOKEN__|${TG_TOKEN}|" "$CONFIG"
     TG_USERS="${ZEROCLAW_TELEGRAM_ALLOWED_USERS:-*}"
-    # Replace the placeholder with actual allowed users (comma-sep → TOML array entries)
+    # Replace the placeholder with actual allowed users (comma-sep -> TOML array entries)
     TG_USERS_TOML=$(echo "$TG_USERS" | sed 's/,/", "/g')
-    sed -i "s|__TELEGRAM_ALLOWED_USERS__|${TG_USERS_TOML}|" "$CONFIG" && echo "[start.sh] allowed_users replaced" || echo "[start.sh] ERROR: allowed_users sed failed"
-    echo "Telegram: enabled (allowed_users: [\"${TG_USERS_TOML}\"])"
+    sed -i "s|__TELEGRAM_ALLOWED_USERS__|${TG_USERS_TOML}|" "$CONFIG"
 else
     # No token — remove the telegram section entirely so channel is not started
-    sed -i '/^\[channels_config\.telegram\]/,/^$/d' "$CONFIG" || echo "[start.sh] WARN: telegram section removal failed"
-    echo "Telegram: not configured (no bot token)"
+    sed -i '/^\[channels_config\.telegram\]/,/^$/d' "$CONFIG"
 fi
 
 echo "=== ZeroClaw Railway startup ==="
-echo "Config: $CONFIG"
 echo "Provider: ${ZEROCLAW_PROVIDER:-${PROVIDER:-openrouter}}"
 echo "Model: ${ZEROCLAW_MODEL:-default}"
 echo "Browser backend: ${ZEROCLAW_BROWSER_BACKEND:-camofox}"
 echo "Camofox URL: ${ZEROCLAW_CAMOFOX_URL:-http://127.0.0.1:3000}"
-
+echo "Telegram: $([ -n "$TG_TOKEN" ] && echo 'configured' || echo 'not configured')"
 echo "================================"
-
-echo "[start.sh] Final config content:"
-cat "$CONFIG"
-echo "[start.sh] --- end config ---"
-echo "[start.sh] Launching: zeroclaw daemon"
 
 exec zeroclaw daemon
 STARTEOF

@@ -1237,6 +1237,10 @@ pub struct BrowserConfig {
 /// Camofox wraps Camoufox (anti-detect Firefox) in a REST API for headless
 /// browsing.  ZeroClaw talks to it over HTTP, creating tabs and issuing
 /// snapshot / click / type / screenshot actions.
+///
+/// The camofox API requires a `userId` (session isolation) and `sessionKey`
+/// (tab grouping) on every request.  These default to `"zeroclaw"` and
+/// `"default"` respectively, which is fine for single-agent deployments.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserCamofoxConfig {
     /// Base URL of the camofox-browser service (e.g. `http://camofox-browser.railway.internal:3000`)
@@ -1248,6 +1252,12 @@ pub struct BrowserCamofoxConfig {
     /// Request timeout in milliseconds. Default: `30000` (30 s).
     #[serde(default = "default_camofox_timeout_ms")]
     pub timeout_ms: u64,
+    /// User ID sent to camofox for session isolation. Default: `"zeroclaw"`.
+    #[serde(default = "default_camofox_user_id")]
+    pub user_id: String,
+    /// Session key sent to camofox for tab grouping. Default: `"default"`.
+    #[serde(default = "default_camofox_session_key")]
+    pub session_key: String,
 }
 
 fn default_camofox_url() -> String {
@@ -1258,12 +1268,22 @@ fn default_camofox_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_camofox_user_id() -> String {
+    "zeroclaw".into()
+}
+
+fn default_camofox_session_key() -> String {
+    "default".into()
+}
+
 impl Default for BrowserCamofoxConfig {
     fn default() -> Self {
         Self {
             url: default_camofox_url(),
             api_key: None,
             timeout_ms: default_camofox_timeout_ms(),
+            user_id: default_camofox_user_id(),
+            session_key: default_camofox_session_key(),
         }
     }
 }
@@ -6358,6 +6378,22 @@ impl Config {
                 if ms > 0 {
                     self.browser.camofox.timeout_ms = ms;
                 }
+            }
+        }
+
+        // Camofox user ID: ZEROCLAW_CAMOFOX_USER_ID
+        if let Ok(uid) = std::env::var("ZEROCLAW_CAMOFOX_USER_ID") {
+            let uid = uid.trim();
+            if !uid.is_empty() {
+                self.browser.camofox.user_id = uid.to_string();
+            }
+        }
+
+        // Camofox session key: ZEROCLAW_CAMOFOX_SESSION_KEY
+        if let Ok(sk) = std::env::var("ZEROCLAW_CAMOFOX_SESSION_KEY") {
+            let sk = sk.trim();
+            if !sk.is_empty() {
+                self.browser.camofox.session_key = sk.to_string();
             }
         }
     }
