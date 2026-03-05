@@ -180,12 +180,32 @@ if [ -n "$ZEROCLAW_BROWSER_ENABLED" ]; then
     esac
 fi
 
+# Telegram channel — inject [channels_config.telegram] from env vars
+TG_TOKEN="${ZEROCLAW_TELEGRAM_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+if [ -n "$TG_TOKEN" ]; then
+    TG_USERS="${ZEROCLAW_TELEGRAM_ALLOWED_USERS:-}"
+    # Build allowed_users array: split comma-separated values into TOML array
+    if [ -n "$TG_USERS" ]; then
+        TG_USERS_TOML=$(echo "$TG_USERS" | sed 's/,/", "/g; s/^/"/; s/$/"/')
+    else
+        TG_USERS_TOML='"*"'
+    fi
+    cat >> "$CONFIG" <<TGEOF
+
+[channels_config.telegram]
+bot_token = "${TG_TOKEN}"
+allowed_users = [${TG_USERS_TOML}]
+TGEOF
+    echo "Telegram: enabled (allowed_users: [${TG_USERS_TOML}])"
+fi
+
 echo "=== ZeroClaw Railway startup ==="
 echo "Config: $CONFIG"
 echo "Provider: ${ZEROCLAW_PROVIDER:-${PROVIDER:-openrouter}}"
 echo "Model: ${ZEROCLAW_MODEL:-default}"
 echo "Browser backend: ${ZEROCLAW_BROWSER_BACKEND:-camofox}"
 echo "Camofox URL: ${ZEROCLAW_CAMOFOX_URL:-http://127.0.0.1:3000}"
+echo "Telegram: ${TG_TOKEN:+configured}${TG_TOKEN:-not configured}"
 echo "================================"
 
 exec zeroclaw gateway
